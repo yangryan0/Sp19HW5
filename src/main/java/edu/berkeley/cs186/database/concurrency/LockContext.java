@@ -1,6 +1,7 @@
 package edu.berkeley.cs186.database.concurrency;
 
 import edu.berkeley.cs186.database.BaseTransaction;
+import org.omg.CORBA.DynAnyPackage.Invalid;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -75,6 +76,19 @@ public class LockContext {
         return ctx;
     }
 
+    private boolean parentSubstitutable(BaseTransaction transaction, LockType lockType) {
+        LockType leastPermissive = LockType.parentLock(lockType);
+        if (parent == null) {
+            return true;
+        }
+        for (Lock l : lockman.getLocks(parent.name)) {
+            if (LockType.substitutable(l.lockType, leastPermissive) && l.transactionNum == transaction.getTransNum()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /**
      * Get the name of the resource that this lock context pertains to.
      */
@@ -94,8 +108,35 @@ public class LockContext {
      */
     public void acquire(BaseTransaction transaction, LockType lockType)
     throws InvalidLockException, DuplicateLockRequestException {
-        throw new UnsupportedOperationException("TODO(hw5_part1): implement");
+        if (readonly) {
+            throw new UnsupportedOperationException("Context is read only");
+        }
+        if (!parentSubstitutable(transaction, lockType)) {
+            throw new InvalidLockException("No parent lock");
+        }
+        lockman.acquire(transaction, name, lockType);
+        LockContext curr = parent;
+        while (curr != null) {
+            if (curr.numChildLocks.containsKey(transaction.getTransNum())) {
+                curr.numChildLocks.put(transaction.getTransNum(), curr.numChildLocks.get(transaction.getTransNum()) + 1);
+            } else {
+                curr.numChildLocks.put(transaction.getTransNum(), 1);
+            }
+            curr = curr.parent;
+        }
     }
+
+    public boolean checkChild(BaseTransaction transaction, Lock child) {
+        List<Lock> parentLocks = new ArrayList<>(lockman.getLocks(name));
+        LockType leastPermissive = LockType.parentLock(child.lockType);
+        for (Lock l : parentLocks) {
+            if (LockType.substitutable(l.lockType, leastPermissive) && l.transactionNum != transaction.getTransNum()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
 
     /**
      * Release TRANSACTION's lock on NAME.
@@ -110,8 +151,26 @@ public class LockContext {
      */
     public void release(BaseTransaction transaction)
     throws NoLockHeldException, InvalidLockException {
-        throw new UnsupportedOperationException("TODO(hw5_part1): implement");
+        if (readonly) {
+            throw new UnsupportedOperationException("Read only");
+        }
+        for (Object c : children.keySet()) {
+            LockContext a = children.get(c);
+            for (Lock l : a.lockman.getLocks(a.name)) {
+                if (!checkChild(transaction, l)) {
+                    throw new InvalidLockException("Invalid Lock.");
+                }
+            }
+        }
+        lockman.release(transaction, name);
+        LockContext curr = parent;
+        while (curr != null) {
+            curr.numChildLocks.put(transaction.getTransNum(), curr.numChildLocks.get(transaction.getTransNum()) - 1);
+            curr = curr.parent;
+        }
     }
+
+
 
     /**
      * Promote TRANSACTION's lock to NEWLOCKTYPE.
@@ -129,7 +188,41 @@ public class LockContext {
      */
     public void promote(BaseTransaction transaction, LockType newLockType)
     throws DuplicateLockRequestException, NoLockHeldException, InvalidLockException {
-        throw new UnsupportedOperationException("TODO(hw5_part1): implement");
+        if (readonly) {
+            throw new UnsupportedOperationException("Context is read only");
+        }
+        if (!parentSubstitutable(transaction, newLockType)) {
+            throw new InvalidLockException("No parent lock");
+        }
+        lockman.promote(transaction, name, newLockType);
+    }
+
+    public void setChildrenToNL(BaseTransaction transaction, LockContext lc) {
+        List<Lock> currLocks = lockman.getLocks(lc.name);
+        Lock lock = null;
+        boolean found = false;
+        for (Lock l : currLocks) {
+            if (l.transactionNum == transaction.getTransNum()) {
+                found = true;
+                lock = l;
+            }
+        }
+        if (!found) {
+            return;
+        }
+        lock.lockType = LockType.NL;
+        LockContext curr = lc.parent;
+        while (curr != null) {
+            curr.numChildLocks.put(transaction.getTransNum(), curr.numChildLocks.get(transaction.getTransNum()) - 1);
+            curr = curr.parent;
+        }
+        if (lc.children.size() == 0) {
+            return;
+        } else {
+            for (Object c : lc.children.keySet()) {
+                setChildrenToNL(transaction, lc.children.get(c));
+            }
+        }
     }
 
     /**
@@ -154,7 +247,33 @@ public class LockContext {
      * @throws UnsupportedOperationException if context is readonly
      */
     public void escalate(BaseTransaction transaction) throws NoLockHeldException {
-        throw new UnsupportedOperationException("TODO(hw5_part1): implement");
+        if (readonly) {
+            throw new UnsupportedOperationException("Read only");
+        }
+        List<Lock> currLocks = lockman.getLocks(name);
+        boolean found = false;
+        boolean onlyS = true;
+        Lock lock = null;
+        for (Lock l : currLocks) {
+            if (l.transactionNum == transaction.getTransNum()) {
+                found = true;
+                lock = l;
+                if (l.lockType == LockType.SIX || l.lockType == LockType.X || l.lockType == LockType.IX) {
+                    onlyS = false;
+                }
+            }
+        }
+        if (!found) {
+            throw new NoLockHeldException("Transaction has no lock at this level");
+        }
+        if (onlyS) {
+            lock.lockType = LockType.S;
+        } else {
+            lock.lockType = LockType.X;
+        }
+        for (Object c : this.children.keySet()) {
+            setChildrenToNL(transaction, this.children.get(c));
+        }
     }
 
     /**
@@ -166,7 +285,30 @@ public class LockContext {
         if (transaction == null) {
             return LockType.NL;
         }
-        throw new UnsupportedOperationException("TODO(hw5_part1): implement");
+        LockContext currContext = this;
+        LockType prevLockType = null;
+        LockType currLockType = null;
+        while (currContext != null && currLockType != LockType.SIX && currLockType != LockType.IS && currLockType != LockType.IX) {
+            for (Lock c : lockman.getLocks(currContext.name)) {
+                if (c.transactionNum == transaction.getTransNum()) {
+                    prevLockType = currLockType;
+                    currLockType = c.lockType;
+                }
+            }
+            currContext = currContext.parent;
+        }
+        if (currLockType == LockType.S || currLockType == LockType.X) {
+            return currLockType;
+        }
+        if (currLockType == LockType.SIX) {
+            return LockType.S;
+        } else {
+            if (prevLockType == null) {
+                return LockType.NL;
+            } else {
+                return prevLockType;
+            }
+        }
     }
 
     /**
@@ -176,7 +318,13 @@ public class LockContext {
         if (transaction == null) {
             return LockType.NL;
         }
-        throw new UnsupportedOperationException("TODO(hw5_part1): implement");
+        List<Lock> currLocks = lockman.getLocks(name);
+        for (Lock l : currLocks) {
+            if (l.transactionNum == transaction.getTransNum()) {
+                return l.lockType;
+            }
+        }
+        return LockType.NL;
     }
 
     /**
